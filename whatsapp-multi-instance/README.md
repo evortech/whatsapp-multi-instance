@@ -30,7 +30,7 @@ Instances you aren't using are *stopped* and use **zero RAM**, so you can create
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/whatsapp-multi-instance.git
+git clone https://github.com/evortech/whatsapp-multi-instance.git
 cd whatsapp-multi-instance
 ./install.sh            # installs docker, adb, scrcpy + the wam command
 ```
