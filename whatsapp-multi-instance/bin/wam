@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# wam - run many Android (Redroid) instances for WhatsApp on Linux
+set -u
+
+VERSION="1.0.0"
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/wam.conf"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+WAM_DIR="${WAM_DIR:-$HOME/redroid}"                 # instance data folders
+WAM_IMAGE="${WAM_IMAGE:-redroid/redroid:13.0.0-latest}"
+WAM_PREFIX="${WAM_PREFIX:-wa}"                      # container names: wa1, wa2 ...
+WAM_BASE_PORT="${WAM_BASE_PORT:-5554}"              # instance N -> port BASE+N
+WAM_COUNT="${WAM_COUNT:-10}"                        # what "all" means for create
+WAM_WIDTH="${WAM_WIDTH:-720}"
+WAM_HEIGHT="${WAM_HEIGHT:-1280}"
+WAM_DPI="${WAM_DPI:-320}"
+WAM_MAX_RUNNING="${WAM_MAX_RUNNING:-5}"             # safety limit for running at once
+WAM_MIN_FREE_MB="${WAM_MIN_FREE_MB:-2500}"          # refuse to start below this free RAM
+WAM_BOOT_TIMEOUT="${WAM_BOOT_TIMEOUT:-180}"         # seconds to wait for Android boot
+WAM_PKG="com.whatsapp"
+WAM_FORCE="${WAM_FORCE:-0}"                         # 1 = ignore RAM/limit checks
+WAM_EXTRA_ARGS="${WAM_EXTRA_ARGS:-}"                # extra redroid boot args
+
+die()  { echo "error: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found. Run ./install.sh"; }
+cname()  { echo "$WAM_PREFIX$1"; }
+port()   { echo $((WAM_BASE_PORT + $1)); }
+serial() { echo "127.0.0.1:$(port "$1")"; }
+
+check_docker() {
+  need docker
+  local out; out=$(docker info 2>&1) && return 0
+  if echo "$out" | grep -qi "permission denied"; then
+    die "no permission for docker. Run: sudo usermod -aG docker \$USER  then log out/in (or: newgrp docker)"
+  fi
+  die "docker is not running. Try: sudo systemctl enable --now docker"
+}
+
+exists()  { docker container inspect "$(cname "$1")" >/dev/null 2>&1; }
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$(cname "$1")" 2>/dev/null)" = true ]; }
+running_count() { docker ps --format '{{.Names}}' | grep -cE "^${WAM_PREFIX}[0-9]+$" || true; }
+free_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
+
+existing_ids() {
+  docker ps -a --format '{{.Names}}' | grep -E "^${WAM_PREFIX}[0-9]+$" | sed "s/^$WAM_PREFIX//" | sort -n
+}
+running_ids() {
+  docker ps --format '{{.Names}}' | grep -E "^${WAM_PREFIX}[0-9]+$" | sed "s/^$WAM_PREFIX//" | sort -n
+}
+
+# Expand "1 3", "2-5", "all" (all = instances that exist; for create: 1..WAM_COUNT)
+expand() {
+  local mode=$1; shift; local out=() a
+  for a in "$@"; do
+    if [ "$a" = all ]; then
+      if [ "$mode" = new ]; then mapfile -t -O "${#out[@]}" out < <(seq 1 "$WAM_COUNT")
+      else mapfile -t -O "${#out[@]}" out < <(existing_ids); fi
+    elif [[ $a =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      mapfile -t -O "${#out[@]}" out < <(seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")
+    elif [[ $a =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ]; then out+=("$a")
+    else die "bad instance '$a' (use: 3 | 1 2 3 | 2-5 | all)"; fi
+  done
+  echo "${out[@]}"
+}
+
+wait_boot() {
+  local s t=0; s=$(serial "$1")
+  printf 'waiting for %s to boot' "$(cname "$1")"
+  while :; do
+    adb connect "$s" >/dev/null 2>&1
+    if [ "$(adb -s "$s" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')" = 1 ]; then echo " ok"; return 0; fi
+    sleep 2; t=$((t+2)); printf '.'
+    [ "$t" -ge "$WAM_BOOT_TIMEOUT" ] && { echo " timeout"; return 1; }
+  done
+}
+
+ram_guard() {
+  [ "$WAM_FORCE" = 1 ] && return 0
+  local f; f=$(free_mb)
+  [ "$f" -lt "$WAM_MIN_FREE_MB" ] && die "only ${f} MB RAM free (need ${WAM_MIN_FREE_MB}). Stop an instance, or WAM_FORCE=1 to override."
+  [ "$(running_count)" -ge "$WAM_MAX_RUNNING" ] && die "$WAM_MAX_RUNNING instances already running (WAM_MAX_RUNNING). Stop one, or WAM_FORCE=1."
+  return 0
+}
+
+start_one() {
+  local n=$1
+  exists "$n" || die "$(cname "$n") doesn't exist. Run: wam create $n"
+  if ! running "$n"; then ram_guard; docker start "$(cname "$n")" >/dev/null || die "could not start $(cname "$n")"; fi
+  wait_boot "$n" || die "$(cname "$n") did not boot. See: wam logs $n"
+}
+
+launch_app() {
+  local s out; s=$(serial "$1")
+  out=$(adb -s "$s" shell am start -n "$WAM_PKG/.Main" 2>&1)
+  if echo "$out" | grep -qi "error"; then
+    adb -s "$s" shell monkey -p "$WAM_PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+  fi
+}
+
+# ---------- commands ----------
+cmd_doctor() {
+  local ok=1 chk
+  chk() { if eval "$2" >/dev/null 2>&1; then echo "  [ok]   $1"; else echo "  [FAIL] $1  -> $3"; ok=0; fi; }
+  echo "wam doctor"
+  chk "docker installed"        "command -v docker" "run ./install.sh"
+  chk "docker usable (no sudo)" "docker info"       "sudo usermod -aG docker \$USER && newgrp docker"
+  chk "adb installed"           "command -v adb"    "sudo apt install adb"
+  chk "scrcpy installed"        "command -v scrcpy" "sudo apt install scrcpy"
+  chk "kernel has binder"       "grep -q binder /proc/filesystems || modinfo binder_linux" "see docs/TROUBLESHOOTING.md (binder)"
+  chk "data folder writable"    "mkdir -p '$WAM_DIR' && [ -w '$WAM_DIR' ]" "sudo chown \$USER:\$USER $WAM_DIR"
+  chk "image downloaded"        "docker image inspect '$WAM_IMAGE'" "wam pull"
+  echo "  free RAM: $(free_mb) MB   (each instance needs ~1.5-2 GB)"
+  [ $ok = 1 ] && echo "all good." || echo "fix the [FAIL] items above."
+}
+
+cmd_pull() {
+  check_docker
+  until docker pull "$WAM_IMAGE"; do echo "download interrupted, retrying in 3s (Ctrl+C to stop)..."; sleep 3; done
+}
+
+cmd_create() {
+  [ $# -ge 1 ] || die "usage: wam create <n...|a-b|all>"
+  check_docker; need adb
+  grep -q binder /proc/filesystems || modinfo binder_linux >/dev/null 2>&1 || die "kernel has no binder support (see docs/TROUBLESHOOTING.md)"
+  mkdir -p "$WAM_DIR"; [ -w "$WAM_DIR" ] || die "$WAM_DIR not writable. Run: sudo chown \$USER:\$USER $WAM_DIR"
+  local n ids; ids=$(expand new "$@") || exit 1
+  for n in $ids; do
+    if exists "$n"; then echo "$(cname "$n")  already exists"; continue; fi
+    mkdir -p "$WAM_DIR/$(cname "$n")"
+    # shellcheck disable=SC2086
+    docker create -it --privileged --name "$(cname "$n")" \
+      -v "$WAM_DIR/$(cname "$n"):/data" \
+      -p "127.0.0.1:$(port "$n"):5555" \
+      "$WAM_IMAGE" \
+      androidboot.redroid_width="$WAM_WIDTH" androidboot.redroid_height="$WAM_HEIGHT" androidboot.redroid_dpi="$WAM_DPI" \
+      $WAM_EXTRA_ARGS >/dev/null && echo "$(cname "$n")  created (adb port $(port "$n"), not started)"
+  done
+  echo "next: wam install /path/to/WhatsApp.apkm <n...>"
+}
+
+cmd_install() {
+  [ $# -ge 1 ] || die "usage: wam install <file.apk|.apkm|.xapk> [n...|all]"
+  need adb; check_docker
+  local file=$1; shift; [ -f "$file" ] || die "file not found: $file"
+  [ $# -eq 0 ] && set -- all
+  local ids n s tmp=""; ids=$(expand existing "$@") || exit 1
+  [ -n "$ids" ] || die "no instances. Run: wam create 1"
+  case "${file,,}" in
+    *.apkm|*.xapk|*.zip)
+      need unzip; tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT
+      unzip -qo "$file" -d "$tmp" || die "could not unzip $file"
+      ls "$tmp"/*.apk >/dev/null 2>&1 || die "no .apk files inside bundle";;
+    *.apk) ;;
+    *) die "unsupported file type (use .apk, .apkm or .xapk)";;
+  esac
+  for n in $ids; do
+    echo "== $(cname "$n") =="
+    start_one "$n"; s=$(serial "$n")
+    if [ -n "$tmp" ]; then adb -s "$s" install-multiple -r "$tmp"/*.apk; else adb -s "$s" install -r "$file"; fi
+  done
+}
+
+cmd_start() { [ $# -ge 1 ] || die "usage: wam start <n...|all>"; check_docker; need adb
+  local n ids; ids=$(expand existing "$@") || exit 1; for n in $ids; do start_one "$n"; done; }
+
+cmd_open() {
+  [ $# -ge 1 ] || die "usage: wam open <n...|all>"; check_docker; need adb; need scrcpy
+  local n ids; ids=$(expand existing "$@") || exit 1
+  for n in $ids; do
+    start_one "$n"
+    setsid scrcpy -s "$(serial "$n")" --window-title "WA $n" >/dev/null 2>&1 &
+    sleep 3; launch_app "$n"; echo "$(cname "$n")  opened"
+  done
+}
+
+cmd_stop() {
+  check_docker; local n ids
+  if [ $# -eq 0 ]; then ids=$(running_ids); else ids=$(expand existing "$@") || exit 1; fi
+  [ -n "$ids" ] || { echo "nothing running"; return; }
+  for n in $ids; do
+    docker stop "$(cname "$n")" >/dev/null 2>&1 && echo "$(cname "$n")  stopped (data kept)"
+    adb disconnect "$(serial "$n")" >/dev/null 2>&1
+  done
+}
+
+cmd_list() {
+  check_docker; printf '%-8s %-9s %-7s\n' INSTANCE STATE ADB-PORT
+  local n; for n in $(existing_ids); do
+    printf '%-8s %-9s %-7s\n' "$(cname "$n")" "$(running "$n" && echo running || echo stopped)" "$(port "$n")"
+  done
+}
+
+cmd_ram() {
+  check_docker
+  echo "free RAM: $(free_mb) MB | running: $(running_count)/$WAM_MAX_RUNNING"
+  docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}' $(docker ps --format '{{.Names}}' | grep -E "^${WAM_PREFIX}[0-9]+$") 2>/dev/null
+}
+
+cmd_logs()  { [ $# -eq 1 ] || die "usage: wam logs <n>"; check_docker; docker logs --tail 50 "$(cname "$1")"; }
+cmd_shell() { [ $# -eq 1 ] || die "usage: wam shell <n>"; need adb; adb -s "$(serial "$1")" shell; }
+
+cmd_remove() {
+  [ $# -eq 1 ] || die "usage: wam remove <n>"; check_docker
+  exists "$1" || die "$(cname "$1") doesn't exist"
+  read -r -p "Delete $(cname "$1") AND its WhatsApp login/data forever? [y/N] " a
+  [ "$a" = y ] || { echo cancelled; return; }
+  docker rm -f "$(cname "$1")" >/dev/null && echo "container removed"
+  # data is owned by root (written by the container)
+  sudo rm -rf "${WAM_DIR:?}/$(cname "$1")" && echo "data removed"
+}
+
+usage() { cat <<U
+wam $VERSION - many Android (Redroid) instances for WhatsApp
+
+usage: wam <command> [instances]       instances: 3 | 1 2 3 | 2-5 | all
+
+setup
+  doctor                       check that everything is ready
+  pull                         download the Android image (auto-retries)
+  create <n...|all>            create instances (stopped; uses no RAM)
+  install <file> [n...|all]    install WhatsApp (.apk / .apkm / .xapk)
+
+daily use
+  open <n...>                  start + show window + launch WhatsApp
+  start <n...|all>             start without a window
+  stop [n...|all]              stop (no argument = stop all). Data is kept
+  list                         show instances
+  ram                          memory/CPU of running instances
+
+maintenance
+  logs <n>   shell <n>   remove <n>
+
+limits: max $WAM_MAX_RUNNING running at once, needs $WAM_MIN_FREE_MB MB free RAM (WAM_FORCE=1 overrides)
+U
+}
+
+c="${1:-}"; [ $# -gt 0 ] && shift
+case "$c" in
+  doctor) cmd_doctor;; pull) cmd_pull;; create) cmd_create "$@";; install) cmd_install "$@";;
+  open) cmd_open "$@";; start) cmd_start "$@";; stop) cmd_stop "$@";; list|ls) cmd_list;;
+  ram) cmd_ram;; logs) cmd_logs "$@";; shell) cmd_shell "$@";; remove|rm) cmd_remove "$@";;
+  -v|--version) echo "wam $VERSION";; *) usage;;
+esac
